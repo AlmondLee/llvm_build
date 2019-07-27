@@ -1,0 +1,329 @@
+#!/usr/bin/env groovy
+pipeline {
+    agent {label 'green-dragon-23'}
+    stages {
+        stage('Subversion Checkout') {
+            steps {
+                timeout(activity: true, time: 30) {
+                    checkout([$class: 'SubversionSCM',
+                              locations: [
+                                  [local: 'llvm.src',
+                                   remote: 'http://llvm.org/svn/llvm-project/llvm/trunk'],
+                                  [local: 'lldb.src',
+                                   remote: 'http://llvm.org/svn/llvm-project/lldb/trunk'],
+                                  [local: 'clang.src',
+                                   remote: 'http://llvm.org/svn/llvm-project/cfe/trunk'],
+                                  [local: 'libcxx.src',
+                                   remote: 'http://llvm.org/svn/llvm-project/libcxx/trunk']],
+                              quietOperation: false,
+                              workspaceUpdater: [$class: 'UpdateUpdater']])
+                }
+            }
+        }
+        stage('Setup LLDB') {
+            steps {
+                timeout(activity: true, time: 30) {
+                    sh '''
+                       set -u
+                       export
+                       python $SCRIPT_PATH/build.py fetch
+                       '''
+                    sh '''
+set -eux
+
+# Avoid the python in /usr/local/bin.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/jbin
+
+if [ -z "WORKSPACE" ]; then
+    echo "WORKSPACE is not set."
+    exit 1
+fi
+
+SRC="$WORKSPACE"
+BUILD="$WORKSPACE/lldb-build"
+TEST="$WORKSPACE/test"
+RESULTS="$WORKSPACE/results"
+DEST="$RESULTS/llvm"
+
+LLVM_SRC="$SRC/llvm"
+LLDB_SRC="$SRC/llvm/tools/lldb"
+TESTCASES_DIR="$LLDB_SRC/test/testcases"
+LOGS_DIR="$TEST/logs"
+RESULTS_FILE="$TEST/results.xml"
+
+CC="$WORKSPACE/host-compiler/bin/clang"
+CXX="$WORKSPACE/host-compiler/bin/clang++"
+
+TOOLS="clang lldb"
+PROJECTS=""
+
+
+echo "@@@ Clean @@@"
+
+CLEAN_DIRS="$TEST $DEST $LOGS_DIR $RESULTS $BUILD/lldb-test-build.noindex"
+
+if [ "$CLEAN" = "true" ]; then
+  CLEAN_DIRS="$BUILD $CLEAN_DIRS"
+fi
+
+for dir in $CLEAN_DIRS; do
+  if [ -d $dir ]; then
+    rm -rf $dir
+  fi
+  mkdir -p $dir
+done
+
+MODULE_CACHE=$(xcrun clang -fmodules -x c - -o /dev/null '-###' 2>&1 | grep -Eo '\\-fmodules-cache-path=[^"]+' | cut -d'=' -f2)
+if [ -d $MODULE_CACHE ]; then
+  rm -rf $MODULE_CACHE
+fi
+rm -rf $BUILD/*/module.cache
+
+rm -f $WORKSPACE/*.tgz
+
+echo "@@@@@@"
+
+mkdir -p $BUILD
+cd $BUILD
+
+echo "@@@ Setup @@@"
+
+{ /usr/local/bin/lldbsign unlock; } 2>/dev/null
+
+echo "@@@@@@"
+
+set +x
+echo "@@@ Environment @@@"
+env | sort
+echo "@@@@@@"
+set -eux
+
+python $SCRIPT_PATH/build.py derive-llvm+clang+libcxx
+rsync -auvh --delete --exclude=.svn/ ${WORKSPACE}/lldb.src/ ${WORKSPACE}/lldb
+
+                       '''
+                }
+            }
+        }
+        stage('Build+Install LLVM, Clang, libcxx (Ninja, RelWithDebInfo)') {
+            steps {
+                timeout(activity: true, time: 30) {
+                    sh '''
+set -eux
+
+# Avoid the python in /usr/local/bin.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/jbin
+
+if [ -z "WORKSPACE" ]; then
+    echo "WORKSPACE is not set."
+    exit 1
+fi
+
+SRC="$WORKSPACE"
+TEST="$WORKSPACE/test"
+DEST="$WORKSPACE/llvm-installtree"
+LLVM_SRC="$SRC/llvm"
+LLDB_SRC="$SRC/lldb"
+
+mkdir -p llvm-buildtree
+cd llvm-buildtree
+
+echo FIXME: The module map in an install tree seems to still have problems.
+
+echo "@@@ CMake @@@"
+cmake $LLVM_SRC \
+    -C$LLDB_SRC/cmake/caches/Apple-lldb-base.cmake \
+    -DCMAKE_INSTALL_PREFIX="" \
+    -DLLVM_INSTALL_UTILS=On \
+    -DLLVM_INSTALL_TOOLCHAIN_ONLY=Off \
+    -DLLVM_ENABLE_MODULES=Off \
+    -DLLVM_VERSION_PATCH=99 \
+    -DPYTHON_EXECUTABLE=/usr/bin/python2.7 \
+    -DPYTHON_LIBRARY=/System/Library/Frameworks/Python.framework/Versions/2.7/lib/libpython2.7.dylib \
+    -DPYTHON_INCLUDE_DIR=/System/Library/Frameworks/Python.framework/Versions/2.7/include/python2.7 \
+    -DPYTHON_LIBRARY_DEBUG=/System/Library/Frameworks/Python.framework/Versions/2.7/lib/libpython2.7.dylib \
+    -G Ninja
+echo "@@@@@@"
+
+echo "@@@ Build @@@"
+ninja
+echo "@@@@@@"
+
+echo "@@@ Install @@@"
+DESTDIR=$DEST ninja install
+echo "@@@@@@"
+                       '''
+                }
+            }
+        }
+        stage('Build+Test against build-tree (Ninja, Release)') {
+            steps {
+                timeout(activity: true, time: 30) {
+                    sh '''
+set -eux
+
+
+# Avoid the python in /usr/local/bin.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/jbin
+
+if [ -z "WORKSPACE" ]; then
+    echo "WORKSPACE is not set."
+    exit 1
+fi
+
+SRC="$WORKSPACE"
+BUILD="$WORKSPACE/lldb-against-buildtree"
+TEST="$WORKSPACE/test"
+DEST="$WORKSPACE/lldb-install"
+LLDB_SRC="$SRC/lldb"
+
+mkdir -p $BUILD
+cd $BUILD
+
+echo "@@@ CMake @@@"
+cmake -L $LLDB_SRC \
+    -C$LLDB_SRC/cmake/caches/Apple-lldb-macOS.cmake \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DLLVM_VERSION_PATCH=99 \
+    -DLLVM_DIR=${WORKSPACE}/llvm-buildtree/lib/cmake/llvm \
+    -DClang_DIR=${WORKSPACE}/llvm-buildtree/lib/cmake/clang \
+    -DPYTHON_EXECUTABLE=/usr/bin/python2.7 \
+    -DPYTHON_LIBRARY=/System/Library/Frameworks/Python.framework/Versions/2.7/lib/libpython2.7.dylib \
+    -DPYTHON_INCLUDE_DIR=/System/Library/Frameworks/Python.framework/Versions/2.7/include/python2.7 \
+    -DPYTHON_LIBRARY_DEBUG=/System/Library/Frameworks/Python.framework/Versions/2.7/lib/libpython2.7.dylib \
+     -G Ninja
+echo "@@@@@@"
+
+echo "@@@ Build @@@"
+ninja
+echo "@@@@@@"
+
+echo "@@@ Test @@@"
+/usr/bin/env TERM=vt100 ninja -v check-lldb
+echo "@@@@@@"
+
+                       '''
+                }
+            }
+        }
+        stage('Build against install-tree (Ninja, Release)') {
+            steps {
+                timeout(activity: true, time: 30) {
+                    sh '''
+set -eux
+
+# Avoid the python in /usr/local/bin.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/jbin
+
+if [ -z "WORKSPACE" ]; then
+    echo "WORKSPACE is not set."
+    exit 1
+fi
+
+SRC="$WORKSPACE"
+BUILD="$WORKSPACE/lldb-against-installtree"
+TEST="$WORKSPACE/test"
+DEST="$WORKSPACE/lldb-install"
+LLDB_SRC="$SRC/lldb"
+
+mkdir -p $BUILD
+cd $BUILD
+
+echo "@@@ CMake @@@"
+cmake -L $LLDB_SRC \
+    -C$LLDB_SRC/cmake/caches/Apple-lldb-macOS.cmake \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DLLVM_ENABLE_MODULES=Off \
+    -DLLVM_VERSION_PATCH=99 \
+    -DLLVM_EXTERNAL_LIT=${WORKSPACE}/llvm-buildtree/bin/llvm-lit \
+    -DLLVM_DIR=${WORKSPACE}/llvm-installtree/lib/cmake/llvm \
+    -DClang_DIR=${WORKSPACE}/llvm-installtree/lib/cmake/clang \
+    -DPYTHON_EXECUTABLE=/usr/bin/python2.7 \
+    -DPYTHON_LIBRARY=/System/Library/Frameworks/Python.framework/Versions/2.7/lib/libpython2.7.dylib \
+    -DPYTHON_INCLUDE_DIR=/System/Library/Frameworks/Python.framework/Versions/2.7/include/python2.7 \
+    -DPYTHON_LIBRARY_DEBUG=/System/Library/Frameworks/Python.framework/Versions/2.7/lib/libpython2.7.dylib \
+    -G Ninja
+echo "@@@@@@"
+
+echo "@@@ Compile @@@"
+ninja
+echo "@@@@@@"
+
+                       '''
+                }
+            }
+        }
+        stage('Build+Test against build-tree (Xcode, Debug)') {
+            steps {
+                timeout(activity: true, time: 30) {
+                    sh '''
+set -eux
+
+
+# Avoid the python in /usr/local/bin.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/jbin
+
+if [ -z "WORKSPACE" ]; then
+    echo "WORKSPACE is not set."
+    exit 1
+fi
+
+SRC="$WORKSPACE"
+BUILD="$WORKSPACE/lldb-xcode-against-buildtree"
+TEST="$WORKSPACE/test"
+DEST="$WORKSPACE/lldb-install"
+LLDB_SRC="$SRC/lldb"
+
+mkdir -p $BUILD
+cd $BUILD
+
+echo "@@@ CMake @@@"
+cmake -L $LLDB_SRC \
+    -C$LLDB_SRC/cmake/caches/Apple-lldb-Xcode.cmake \
+    -DLLVM_VERSION_PATCH=99 \
+    -DLLVM_DIR=${WORKSPACE}/llvm-buildtree/lib/cmake/llvm \
+    -DClang_DIR=${WORKSPACE}/llvm-buildtree/lib/cmake/clang \
+    -DPYTHON_EXECUTABLE=/usr/bin/python2.7 \
+    -DPYTHON_LIBRARY=/System/Library/Frameworks/Python.framework/Versions/2.7/lib/libpython2.7.dylib \
+    -DPYTHON_INCLUDE_DIR=/System/Library/Frameworks/Python.framework/Versions/2.7/include/python2.7 \
+    -DPYTHON_LIBRARY_DEBUG=/System/Library/Frameworks/Python.framework/Versions/2.7/lib/libpython2.7.dylib \
+     -G Xcode
+echo "@@@@@@"
+
+echo "@@@ Build @@@"
+cmake --build . --config Debug
+echo "@@@@@@"
+
+echo "@@@ Test @@@"
+cmake --build . --config Debug --target lldb-test-deps
+cd ${BUILD}/lit && /usr/bin/env TERM=vt100 /usr/bin/python2.7 ${WORKSPACE}/llvm-buildtree/bin/llvm-lit --verbose --param build_mode=Debug ${BUILD}/lit
+echo "@@@@@@"
+
+                       '''
+                }
+            }
+        }
+        stage('Cleanup') {
+            steps {
+                timeout(activity: true, time: 30) {
+                    sh '''
+set -eux
+# Avoid the python in /usr/local/bin.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/jbin
+
+if [ -z "WORKSPACE" ]; then
+    echo "WORKSPACE is not set."
+    exit 1
+fi
+
+SRC="$WORKSPACE"
+BUILD="$WORKSPACE/lldb-build"
+
+# Delete directories that would get deleted first thing by the next build anyway.
+rm -rf $BUILD/*/lldb-test-build.noindex $BUILD/*/module.cache
+                       '''
+                }
+            }
+        }
+    }
+}
